@@ -1,0 +1,940 @@
+
+/**
+ * @file /src/qnode.cpp
+ *
+ * @brief Ros communication central!
+ *
+ * @date February 2011
+ **/
+
+/*****************************************************************************
+** Includes
+*****************************************************************************/
+
+//#include <ros/ros.h>
+#include <ros/network.h>
+#include <string>
+#include <std_msgs/String.h>
+#include <sstream>
+#include "../include/replay_tool/qnode.hpp"
+#include "../include/replay_tool/datathread.h"
+#include <QApplication>
+#include <QFileDialog>
+#include <QDir>
+#include <QString>
+#include <QStringList>
+#include <QDebug>
+
+
+
+
+#include <asm/ioctl.h>
+#include <asm/ioctls.h>
+
+
+
+#include <QMutexLocker>
+using namespace std;
+
+
+Publishers::Publishers(QObject *parent,QMutex *p_mutex) :
+    QThread(parent), mutex_(p_mutex)
+{
+    processed_stamp_ = 0;
+    play_rate_ = 1.0;
+    loop_flag_ = false;
+    stop_skip_flag_ = true;
+    stereo_active_ = true;
+    search_bound_ = 10;
+    reset_process_stamp_flag_ = true;
+    auto_start_flag_ = true;
+    stamp_show_count_ = 0;
+    prev_clock_stamp_ = 0;
+
+
+    imu_play_flag_ = false;
+    gnss_play_flag_ = false;
+    stereo_play_flag_ = false;
+    bfs_play_flag_ = false;
+
+    velodyne_32_play_flag_ = false;
+    velodyne_16_play_flag_ = false;
+
+
+
+}
+
+
+Publishers::~Publishers() {
+    data_stamp_thread_.active_ = false;
+    gnss_thread_.active_ = false;
+    imu_thread_.active_ = false;
+    velodyne_16_thread_.active_ = false;
+    velodyne_32_thread_.active_ = false;
+    stereo_thread_.active_ = false;
+    usleep(100000);
+
+    data_stamp_thread_.cv_.notify_all();
+    if(data_stamp_thread_.thread_.joinable())  data_stamp_thread_.thread_.join();
+
+
+    gnss_thread_.cv_.notify_all();
+    if(gnss_thread_.thread_.joinable()) gnss_thread_.thread_.join();
+
+
+
+    imu_thread_.cv_.notify_all();
+    if(imu_thread_.thread_.joinable()) imu_thread_.thread_.join();
+
+    velodyne_16_thread_.cv_.notify_all();
+    if(velodyne_16_thread_.thread_.joinable()) velodyne_16_thread_.thread_.join();
+
+    velodyne_32_thread_.cv_.notify_all();
+    if(velodyne_32_thread_.thread_.joinable()) velodyne_32_thread_.thread_.join();
+
+
+
+    stereo_thread_.cv_.notify_all();
+    if(stereo_thread_.thread_.joinable()) stereo_thread_.thread_.join();
+
+    bfs_thread_.cv_.notify_all();
+    if(bfs_thread_.thread_.joinable()) bfs_thread_.thread_.join();
+}
+
+
+void Publishers::ros_init(ros::NodeHandle &n)
+{
+  nh_ = n;
+
+  pre_timer_stamp_ = ros::Time::now().toNSec();
+  //万分之一秒执行一次，不是只执行一次
+  timer_ = nh_.createTimer(ros::Duration(0.0001), boost::bind(&Publishers::TimerCallback, this, _1));
+  //ros::Timer ros::NodeHandle::createTimer(ros::Duration period, <callback>, bool oneshot = false);
+  Gnss_pub = nh_.advertise<sensor_msgs::NavSatFix>("gnss", 1000);
+//  if(imu_play_flag_ == true)
+  Imu_pub = nh_.advertise<sensor_msgs::Imu>("imu_pub", 1000);
+  Velodyne_32_pub = nh_.advertise<sensor_msgs::PointCloud2>("velodyne_32", 1000);
+  Velodyne_16_pub = nh_.advertise<sensor_msgs::PointCloud2>("velodyne_16", 1000);
+  Bfs_left_pub = nh_.advertise<sensor_msgs::Image>("bfs_left_pub", 10);
+  Bfs_right_pub = nh_.advertise<sensor_msgs::Image>("bfs_right_pub", 10);
+  Stereo_left_pub = nh_.advertise<sensor_msgs::Image>("Stereo_right_pub_", 10);
+  Stereo_right_pub = nh_.advertise<sensor_msgs::Image>("Stereo_right_pub_", 10);
+  Clock_pub = nh_.advertise<rosgraph_msgs::Clock>("/clock", 1);
+
+}
+
+
+
+
+
+
+
+void Publishers::run()
+{
+  ros::AsyncSpinner spinner(0);
+  spinner.start();
+  ros::waitForShutdown();
+}
+
+
+
+void Publishers::Ready()
+{
+    data_stamp_thread_.active_ = false;
+    data_stamp_thread_.cv_.notify_all();
+    if(data_stamp_thread_.thread_.joinable())  data_stamp_thread_.thread_.join();
+    gnss_thread_.active_ = false;
+    gnss_thread_.cv_.notify_all();
+    if(gnss_thread_.thread_.joinable()) gnss_thread_.thread_.join();
+    bfs_thread_.active_ = false;
+    bfs_thread_.cv_.notify_all();
+    if(bfs_thread_.thread_.joinable()) bfs_thread_.thread_.join();
+    imu_thread_.active_ = false;
+    imu_thread_.cv_.notify_all();
+    if(imu_thread_.thread_.joinable()) imu_thread_.thread_.join();
+    velodyne_16_thread_.active_ = false;
+    velodyne_16_thread_.cv_.notify_all();
+    if(velodyne_16_thread_.thread_.joinable()) velodyne_16_thread_.thread_.join();
+    velodyne_32_thread_.active_ = false;
+    velodyne_32_thread_.cv_.notify_all();
+    if(velodyne_32_thread_.thread_.joinable()) velodyne_32_thread_.thread_.join();
+    stereo_thread_.active_ = false;
+    stereo_thread_.cv_.notify_all();
+    if(stereo_thread_.thread_.joinable()) stereo_thread_.thread_.join();
+
+
+
+
+
+
+       if(check_load_path(load_path_+"/sensor_data/")==true){
+
+           cout << "Successfully loaded Stamp data" << endl;
+           getTime_stamp();
+       }else
+           return;
+
+
+
+       if(check_load_path(load_path_+"/sensor_data/xsens_imu.csv")==true){
+           if(imu_play_flag_ == true){
+               cout << "Successfully loaded Imu data" << endl;
+               getIMU();
+           }
+       }else
+           imu_play_flag_ = false;
+
+
+       if(check_load_path(load_path_+"/sensor_data/gps.csv")==true){
+
+           cout << "Successfully loaded Gnss data" << endl;
+           getGNSS();
+
+       }else
+           gnss_play_flag_ = false;
+
+
+
+       if(check_load_path(load_path_+"/sensor_data/VLP_left/")==true){
+
+           cout << "Successfully loaded Velodyne_16 data" << endl;
+
+       }else
+           velodyne_16_play_flag_ = false;
+
+
+
+    if(check_load_path(load_path_+"/sensor_data/VLP_right/")==true){
+
+        cout << "Successfully loaded Velodyne_32 data" << endl;
+    }else
+        velodyne_32_play_flag_ = false;
+
+
+
+
+//    velodyne_16_file_list_.clear();
+//    velodyne_32_file_list_.clear();
+
+//    get_velodyne_16_list(velodyne_16_file_list_);
+//    get_velodyne_32_list(velodyne_32_file_list_);
+
+
+
+
+
+
+    data_stamp_thread_.active_ = true;
+    gnss_thread_.active_ = true;
+    imu_thread_.active_ = true;
+    velodyne_16_thread_.active_ = true;
+    velodyne_32_thread_.active_ = true;
+    stereo_thread_.active_ = true;
+    bfs_thread_.active_ = true;
+
+
+    data_stamp_thread_.thread_ = std::thread(&Publishers::DataStampThread,this);
+    gnss_thread_.thread_ = std::thread(&Publishers::Gnss_pub_thread,this);
+    imu_thread_.thread_ = std::thread(&Publishers::Imu_pub_thread,this);
+    velodyne_16_thread_.thread_ = std::thread(&Publishers::Velodyne_16_pub_thread,this);
+    velodyne_32_thread_.thread_ = std::thread(&Publishers::Velodyne_32_pub_thread,this);
+    stereo_thread_.thread_ = std::thread(&Publishers::Stereo_pub_thread,this);
+    bfs_thread_.thread_ = std::thread(&Publishers::Bfs_pub_thread,this);
+
+}
+
+
+
+
+
+
+
+
+void Publishers::DataStampThread(){
+    auto stop_region_iter = stop_period_.begin();
+
+    for(auto iter = data_stamp_.begin() ; iter != data_stamp_.end() ; iter ++){
+      auto stamp = iter->first;
+
+
+      while((stamp > (initial_data_stamp_+processed_stamp_))&&(data_stamp_thread_.active_ == true)){
+        if(processed_stamp_ == 0){
+            iter = data_stamp_.begin();
+            stop_region_iter = stop_period_.begin();
+            stamp = iter->first;
+        }
+        usleep(1);
+        if(reset_process_stamp_flag_ == true) break;
+        //wait for data publish
+      }
+
+
+      if(reset_process_stamp_flag_ == true){
+          auto target_stamp = processed_stamp_ + initial_data_stamp_;
+          //set iter
+          iter = data_stamp_.lower_bound(target_stamp);//lower_bound功能：查找非递减序列[first,last) 内第一个大于或等于某个元素的位置。
+          iter = prev(iter,1);
+          //set stop region order
+          auto new_stamp = iter->first;
+          stop_region_iter = stop_period_.upper_bound(new_stamp);//upper_bound功能：查找非递减序列[first,last) 内第一个大于某个元素的位置。
+
+          reset_process_stamp_flag_ = false;
+          continue;
+        }
+
+
+      if(data_stamp_thread_.active_ == false) return;
+      if(iter->second.compare("gps") == 0 && gnss_play_flag_ ==  true){
+        gnss_thread_.push(stamp);
+        gnss_thread_.cv_.notify_all();
+      }else if(iter->second.compare("imu") == 0 && imu_play_flag_ ==  true){
+        imu_thread_.push(stamp);
+        imu_thread_.cv_.notify_all();
+      }else if(iter->second.compare("velodyne_left") == 0 && velodyne_16_play_flag_ == true){
+          get_velodyne_16(stamp);
+          velodyne_16_thread_.push(stamp);
+          velodyne_16_thread_.cv_.notify_all();
+      }else if(iter->second.compare("velodyne_right") == 0 && velodyne_32_play_flag_ == true){
+          get_velodyne_32(stamp);
+          velodyne_32_thread_.push(stamp);
+          velodyne_32_thread_.cv_.notify_all();
+     }else if(iter->second.compare("stereo") == 0 && stereo_active_ == true && stereo_play_flag_ ==  true){
+          stereo_thread_.push(stamp);
+          stereo_thread_.cv_.notify_all();
+      }
+      stamp_show_count_++;
+      if(stamp_show_count_ > 100){
+        stamp_show_count_ = 0;
+        emit StampShow(stamp);
+      }
+
+      if(prev_clock_stamp_ == 0 || (stamp - prev_clock_stamp_) > 10000000){
+          rosgraph_msgs::Clock clock;
+          clock.clock.fromNSec(stamp);
+          Clock_pub.publish(clock);
+          prev_clock_stamp_ = stamp;
+      }
+
+
+
+//      if(loop_flag_ == true && iter == prev(data_stamp_.end(),1)){
+//          iter = data_stamp_.begin();
+//          stop_region_iter = stop_period_.begin();
+//          processed_stamp_ = 0;
+//      }
+//      if(loop_flag_ == false && iter == prev(data_stamp_.end(),1)){
+//          play_flag_ = false;
+//          while(!play_flag_){
+//              iter = data_stamp_.begin();
+//              stop_region_iter = stop_period_.begin();
+//              processed_stamp_ = 0;
+//              usleep(10000);
+//          }
+//      }
+
+
+
+    }
+    std::cout << "Data publish complete" << endl;
+}
+
+
+
+
+
+void Publishers::TimerCallback(const ros::TimerEvent&){
+
+    int64_t current_stamp = ros::Time::now().toNSec();
+    if(play_flag_ == true && pause_flag_ == false){
+      processed_stamp_ += static_cast<int64_t>(static_cast<double>(current_stamp - pre_timer_stamp_) * play_rate_);
+    }
+    pre_timer_stamp_ = current_stamp;
+
+    if(play_flag_ == false){
+      processed_stamp_ = 0; //reset
+      prev_clock_stamp_ = 0;
+    }
+}
+
+
+
+bool Publishers::check_load_path(string path)
+{
+    ifstream f(path.c_str());
+    if(!f.good()){
+       cout << "Please check the input path."<<"'"<< path <<"'"<< " does not exist " << endl;
+       return false;
+    }else
+        return true;
+}
+
+
+
+
+
+int fileNameFilter(const struct dirent *cur) {
+    string str(cur->d_name);
+    if (str.find(".bin") != string::npos) {
+        return 1;
+    }
+    return 0;
+}
+
+int Publishers::get_velodyne_16_list(vector<string> &files)
+{
+
+    string filename;
+    filename = load_path_+"/sensor_data/VLP_left";
+    vector<string> ret;
+    struct dirent **namelist;
+    int n;
+
+//    //scandir函数：读取特定的目录数据
+//    // scandir()会扫描参数dir指定的目录文件，经由参数select指定的函数来挑选目录结构至参数namelist数组中，最后再调用
+
+    if ((n= scandir(filename.c_str(), &namelist, fileNameFilter, alphasort)) < 0)
+        return 0;
+    for (int i = 0; i < n; ++i) {
+        string filePath(namelist[i]->d_name);
+        ret.push_back(filePath);
+        free(namelist[i]);
+    };
+    free(namelist);
+    for(auto iter = ret.rbegin() ; iter!= ret.rend() ; iter++){
+      files.push_back(*iter);
+    }
+      return 0;
+
+
+
+
+
+//    vector<string> ret;
+//    struct dirent **namelist;
+//    int n;
+//    string filename;
+//    filename = load_path_+"/sensor_data/VLP_left";
+
+
+
+    //scandir函数：读取特定的目录数据
+    // scandir()会扫描参数dir指定的目录文件，经由参数select指定的函数来挑选目录结构至参数namelist数组中，最后再调用
+
+//    if ((n = scandir(filename.c_str(),&namelist, 0 , alphasort)) < 0)
+//        return 0;
+//    else {
+//        while (n--) {
+//        if(strcmp(namelist[n]->d_name,".") != 0  || strcmp(namelist[n]->d_name,"..") != 0){
+//          ret.push_back(string(namelist[n]->d_name));//尾插元素
+//        }
+//        free(namelist[n]);
+//        }
+//        free(namelist);
+//    }
+
+//    for(auto iter = ret.rbegin() ; iter!= ret.rend() ; iter++){
+//      files.push_back(*iter);
+//    }
+//      return 0;
+
+
+}
+
+int Publishers::get_velodyne_32_list(vector<string> &files)
+{
+    string filename;
+    filename = load_path_+"/sensor_data/VLP_right";
+    vector<string> ret;
+    struct dirent **namelist;
+    int n;
+//    //scandir函数：读取特定的目录数据
+//    // scandir()会扫描参数dir指定的目录文件，经由参数select指定的函数来挑选目录结构至参数namelist数组中，最后再调用
+
+    if ((n= scandir(filename.c_str(), &namelist, fileNameFilter, alphasort)) < 0)
+        return 0;
+    for (int i = 0; i < n; ++i) {
+        string filePath(namelist[i]->d_name);
+        ret.push_back(filePath);
+        free(namelist[i]);
+    };
+    free(namelist);
+    for(auto iter = ret.rbegin() ; iter!= ret.rend() ; iter++){
+      files.push_back(*iter);
+    }
+      return 0;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+////    else {
+//        while (n--) {
+////        if(strcmp(namelist[n]->d_name,".") != 0  || strcmp(namelist[n]->d_name,".."){
+////          ret.push_back(string(namelist[n]->d_name));//尾插元素
+////        }
+////        free(namelist[n]);
+////        }
+////        free(namelist);
+////    }
+
+//              for (int i = 0; i < n; ++i) {
+//                  string filePath(namelist[i]->d_name);
+//                  ret.push_back(filePath);
+//                  free(namelist[i]);
+//              };
+//              free(namelist);
+//        }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//      int fileNameFilter(const struct dirent *cur) {
+//          std::string str(cur->d_name);
+//          if (str.find(".bin") != std::string::npos) {
+//              return 1;
+//          }
+//          return 0;
+//      }
+
+//      std::vector<std::string> getDirBinsSortedPath(std::string dirPath) {
+//          struct dirent **namelist;
+//          std::vector<std::string> ret;
+//          int n = scandir(dirPath.c_str(), &namelist, fileNameFilter, alphasort);
+//          if (n < 0) {
+//              return ret;
+//          }
+//          for (int i = 0; i < n; ++i) {
+//              std::string filePath(namelist[i]->d_name);
+//              ret.push_back(filePath);
+//              free(namelist[i]);
+//          };
+//          free(namelist);
+//          return ret;
+
+
+
+
+}
+
+
+
+
+int Publishers::getTime_stamp()
+{
+    FILE *fp;
+    int64_t stamp;
+    string filename;
+    filename = load_path_+"/sensor_data/data_stamp.csv" ;
+    char data_name[50];
+    fp = fopen(filename.c_str(),"r");
+
+    while(fscanf(fp,"%ld,%s\n",&stamp,data_name) == 2){
+      data_stamp_.insert( multimap<int64_t, string>::value_type(stamp, data_name));
+    }
+
+    cout << "Successfully loaded Stamp data" << endl;
+    fclose(fp);
+
+    initial_data_stamp_ = data_stamp_.begin()->first - 1;
+    //C++迭代器的上一个元素prev()   反向偏移
+    last_data_stamp_ = prev(data_stamp_.end(),1)->first - 1;
+
+}
+
+int Publishers::getGNSS(){
+
+    FILE *fp;
+    int64_t stamp;
+    string filename;
+
+
+    filename =load_path_+"/sensor_data/gps.csv";
+
+    fp = fopen(filename.c_str(),"r");
+    double array[13];
+    sensor_msgs::NavSatFix gps_data;
+    gnss_data_.clear();
+
+
+    while(fscanf(fp,"%ld,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf\n",&stamp,&array[0],&array[1],&array[2],&array[3],&array[4],&array[5],&array[6],&array[7],&array[8],&array[9],&array[10],&array[11]) == 13){
+      gps_data.header.stamp.fromNSec(stamp);
+      gps_data.header.frame_id = "gnss";
+      gps_data.latitude = array[0];
+      gps_data.longitude = array[1];
+      gps_data.altitude = array[2];
+      gps_data.position_covariance[0] = array[3];
+      gps_data.position_covariance[1] = array[4];
+      gps_data.position_covariance[2] = array[5];
+      gps_data.position_covariance[3] = array[6];
+      gps_data.position_covariance[4] = array[7];
+      gps_data.position_covariance[5] = array[8];
+      gps_data.position_covariance[6] = array[9];
+      gps_data.position_covariance[7] = array[10];
+      gps_data.position_covariance[8] = array[11];
+      gnss_data_[stamp] = gps_data;
+    }
+    cout << "Successfully loaded Gnss data" << endl;
+    fclose(fp);
+
+
+}
+
+int Publishers::getIMU()
+{
+
+        FILE *fp;
+        int64_t stamp;
+        string filename;
+        filename =load_path_+"/sensor_data/xsens_imu.csv";
+         fp = fopen(filename.c_str(),"r");
+
+
+         sensor_msgs::Imu imu_data;
+          imu_data_.clear();
+                    double array[16];
+
+
+                    while(fscanf(fp,"%ld,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf\n",&stamp,&array[0],&array[1],&array[2],&array[3],&array[4],&array[5],&array[6],&array[7],&array[8],&array[9],&array[10],&array[11],&array[12],&array[13],&array[14],&array[15]) ==17)
+                    {
+
+                        imu_data.header.stamp.fromNSec(stamp);
+                        imu_data.header.frame_id = "imu";
+                        imu_data.orientation.x = array[0];
+                        imu_data.orientation.y = array[1];
+                        imu_data.orientation.z = array[2];
+                        imu_data.orientation.w = array[3];
+                        imu_data.angular_velocity.x = array[7];
+                        imu_data.angular_velocity.y = array[8];
+                        imu_data.angular_velocity.z = array[9];
+                        imu_data.linear_acceleration.x = array[10];
+                        imu_data.linear_acceleration.y = array[11];
+                        imu_data.linear_acceleration.z = array[12];
+
+
+
+                        imu_data.orientation_covariance[0] = 3;
+                        imu_data.orientation_covariance[4] = 3;
+                        imu_data.orientation_covariance[8] = 3;
+                        imu_data.angular_velocity_covariance[0] = 3;
+                        imu_data.angular_velocity_covariance[4] = 3;
+                        imu_data.angular_velocity_covariance[8] = 3;
+                        imu_data.linear_acceleration_covariance[0] = 3;
+                        imu_data.linear_acceleration_covariance[4] = 3;
+                        imu_data.linear_acceleration_covariance[8] = 3;
+
+
+                        imu_data_[stamp] = imu_data;
+
+
+
+                   }
+            cout << "Successfully loaded Imu data" << endl;
+            fclose(fp);
+
+
+
+}
+
+
+
+int Publishers::get_velodyne_16(int64_t stamp){
+
+        ifstream file;
+        string filename = load_path_ + "/sensor_data/VLP_left" +"/"+ to_string(stamp) + ".bin";
+        pcl::PointXYZI point;
+        file.open(filename, ios::binary);
+
+
+
+while(!file.eof()){
+
+    file.read(reinterpret_cast<char *>(&point.x), sizeof(float));
+    file.read(reinterpret_cast<char *>(&point.y), sizeof(float));
+    file.read(reinterpret_cast<char *>(&point.z), sizeof(float));
+    file.read(reinterpret_cast<char *>(&point.intensity), sizeof(float));
+    velodyne_16_cloud.points.push_back (point);
+
+}
+        file.close();
+        pcl::toROSMsg(velodyne_16_cloud, publish_16_cloud); //pcl::PointCloud <pcl::PointXYZ>转pcl::PCLPointCloud2   pcl::fromPCLPointCloud2(pcl::PointCloud<pcl::PointXYZ>,pcl::PCLPointCloud2);
+        velodyne_16_cloud.clear();
+        return 0;
+
+        
+}
+
+int Publishers::get_velodyne_32(int64_t stamp)
+{
+
+    ifstream file;
+
+    string filename = load_path_ + "/sensor_data/VLP_right" +"/"+ to_string(stamp) + ".bin";
+
+    pcl::PointXYZI point;
+    file.open(filename, ios::binary);
+
+while(!file.eof()){
+
+
+file.read(reinterpret_cast<char *>(&point.x), sizeof(float));
+file.read(reinterpret_cast<char *>(&point.y), sizeof(float));
+file.read(reinterpret_cast<char *>(&point.z), sizeof(float));
+file.read(reinterpret_cast<char *>(&point.intensity), sizeof(float));
+velodyne_32_cloud.points.push_back (point);
+
+}
+    file.close();
+    pcl::toROSMsg(velodyne_32_cloud, publish_32_cloud); //pcl::PointCloud <pcl::PointXYZ>转pcl::PCLPointCloud2
+    //pcl::fromPCLPointCloud2(pcl::PointCloud<pcl::PointXYZ>,pcl::PCLPointCloud2);
+    velodyne_32_cloud.clear();
+    return 0;
+}
+
+
+
+
+
+void Publishers::StereoThread()
+{
+  int current_img_index = 0;
+  int previous_img_index = 0;
+
+  while(1){
+    std::unique_lock<std::mutex> ul(stereo_thread_.mutex_);
+    stereo_thread_.cv_.wait(ul);
+    if(stereo_thread_.active_ == false) return;
+    ul.unlock();
+
+    while(!stereo_thread_.data_queue_.empty()){
+      auto data = stereo_thread_.pop();
+      //process
+      if(stereo_file_list_.size() == 0) continue;
+
+      //publish
+      if(to_string(data)+".png" == stereo_left_next_img_.first && !stereo_left_next_img_.second.empty() && !stereo_right_next_img_.second.empty()){
+        cv_bridge::CvImage left_out_msg;
+        left_out_msg.header.stamp.fromNSec(data);
+        left_out_msg.header.frame_id = "stereo_left";
+        left_out_msg.encoding = sensor_msgs::image_encodings::BAYER_BGGR8;
+        left_out_msg.image    = stereo_left_next_img_.second;
+
+        cv_bridge::CvImage right_out_msg;
+        right_out_msg.header.stamp.fromNSec(data);
+        right_out_msg.header.frame_id = "stereo_right";
+        right_out_msg.encoding = sensor_msgs::image_encodings::BAYER_BGGR8;
+        right_out_msg.image    = stereo_right_next_img_.second;
+
+        stereo_left_info_.header.stamp.fromNSec(data);
+        stereo_left_info_.header.frame_id = "/stereo/left";
+        stereo_right_info_.header.stamp.fromNSec(data);
+        stereo_right_info_.header.frame_id = "/stereo/right";
+
+        Stereo_left_pub.publish(left_out_msg.toImageMsg());
+        Stereo_right_pub.publish(right_out_msg.toImageMsg());
+
+        Stereo_left_info_pub.publish(stereo_left_info_);
+        Stereo_right_info_pub.publish(stereo_right_info_);
+
+      }else{
+//        cout << "Re-load stereo image from image path" << endl;
+
+        string current_stereo_left_name = load_path_ + "/image/stereo_left" +"/"+ to_string(data)+".png";
+        string current_stereo_right_name = load_path_ + "/image/stereo_right" +"/"+ to_string(data)+".png";
+        cv::Mat current_left_image;
+        cv::Mat current_right_image;
+        current_left_image = imread(current_stereo_left_name, CV_LOAD_IMAGE_ANYDEPTH);
+        current_right_image = imread(current_stereo_right_name, CV_LOAD_IMAGE_ANYDEPTH);
+
+        if(!current_left_image.empty() && !current_right_image.empty()){
+
+            cv_bridge::CvImage left_out_msg;
+            left_out_msg.header.stamp.fromNSec(data);
+            left_out_msg.header.frame_id = "stereo_left";
+            left_out_msg.encoding = sensor_msgs::image_encodings::BAYER_BGGR8;
+            left_out_msg.image    = current_left_image;
+
+            cv_bridge::CvImage right_out_msg;
+            right_out_msg.header.stamp.fromNSec(data);
+            right_out_msg.header.frame_id = "stereo_right";
+            right_out_msg.encoding = sensor_msgs::image_encodings::BAYER_BGGR8;
+            right_out_msg.image    = current_right_image;
+
+            stereo_left_info_.header.stamp.fromNSec(data);
+            stereo_left_info_.header.frame_id = "/stereo/left";
+            stereo_right_info_.header.stamp.fromNSec(data);
+            stereo_right_info_.header.frame_id = "/stereo/right";
+
+            Stereo_left_pub.publish(left_out_msg.toImageMsg());
+            Stereo_right_pub.publish(right_out_msg.toImageMsg());
+
+            Stereo_left_info_pub.publish(stereo_left_info_);
+            Stereo_right_info_pub.publish(stereo_right_info_);
+        }
+        previous_img_index = 0;
+
+
+      }
+
+      //load next image
+      current_img_index = find(next(stereo_file_list_.begin(), max(0,previous_img_index - search_bound_)),stereo_file_list_.end(),to_string(data)+".png") - stereo_file_list_.begin();
+      if(current_img_index < stereo_file_list_.size()-2){
+
+          string next_stereo_left_name = load_path_ + "/image/stereo_left" +"/"+ stereo_file_list_[current_img_index+1];
+          string next_stereo_right_name = load_path_ + "/image/stereo_right" +"/"+ stereo_file_list_[current_img_index+1];
+          cv::Mat next_left_image;
+          cv::Mat next_right_image;
+          next_left_image = imread(next_stereo_left_name, CV_LOAD_IMAGE_ANYDEPTH);
+          next_right_image = imread(next_stereo_right_name, CV_LOAD_IMAGE_ANYDEPTH);
+          if(!next_left_image.empty() && !next_right_image.empty()){
+              stereo_left_next_img_ = make_pair(stereo_file_list_[current_img_index+1], next_left_image);
+              stereo_right_next_img_ = make_pair(stereo_file_list_[current_img_index+1], next_right_image);
+          }
+
+      }
+      previous_img_index = current_img_index;
+    }
+    if(stereo_thread_.active_ == false) return;
+  }
+}
+
+
+
+
+
+
+
+
+void Publishers::Imu_pub_thread(){
+
+    while(1){
+      std::unique_lock<std::mutex> ul(imu_thread_.mutex_);
+      imu_thread_.cv_.wait(ul);
+      if(imu_thread_.active_ == false) return;
+      ul.unlock();
+
+      while(!imu_thread_.data_queue_.empty()){
+        auto data = imu_thread_.pop();
+        //process
+        if(imu_data_.find(data) != imu_data_.end()){
+          Imu_pub.publish(imu_data_[data]);
+          }
+
+      }
+      if(imu_thread_.active_ == false) return;
+    }
+}
+void Publishers::Gnss_pub_thread()
+{
+    while(1){
+      std::unique_lock<std::mutex> ul(gnss_thread_.mutex_);
+      gnss_thread_.cv_.wait(ul);
+      if(gnss_thread_.active_ == false) return;
+      ul.unlock();
+      while(!gnss_thread_.data_queue_.empty()){
+        auto data = gnss_thread_.pop();
+        if(gnss_data_.find(data) != gnss_data_.end()){
+          Gnss_pub.publish(gnss_data_[data]);
+        }
+      }
+      if(gnss_thread_.active_ == false) return;
+    }
+}
+void Publishers::Velodyne_16_pub_thread()
+{
+    while(1){
+      std::unique_lock<std::mutex> ul(velodyne_16_thread_.mutex_);
+      velodyne_16_thread_.cv_.wait(ul);
+      if(velodyne_16_thread_.active_ == false) return;
+      ul.unlock();
+      while(!velodyne_16_thread_.data_queue_.empty()){
+        auto data = velodyne_16_thread_.pop();
+              publish_16_cloud.header.stamp.fromNSec(data);
+              publish_16_cloud.header.frame_id = "left_velodyne";
+              Velodyne_16_pub.publish(publish_16_cloud);
+              velodyne_16_cloud.clear();
+
+
+  }
+
+      if(velodyne_16_thread_.active_ == false) return;
+    }
+
+
+}
+void Publishers:: Velodyne_32_pub_thread()
+{
+    while(1){
+      std::unique_lock<std::mutex> ul(velodyne_32_thread_.mutex_);
+      velodyne_32_thread_.cv_.wait(ul);
+      if(velodyne_32_thread_.active_ == false) return;
+      ul.unlock();
+      while(!velodyne_32_thread_.data_queue_.empty()){
+        auto data = velodyne_32_thread_.pop();
+              publish_32_cloud.header.stamp.fromNSec(data);
+              publish_32_cloud.header.frame_id = "left_velodyne";
+              Velodyne_32_pub.publish(publish_32_cloud);
+              velodyne_32_cloud.clear();
+
+
+  }
+
+      if(velodyne_32_thread_.active_ == false) return;
+    }
+
+}
+
+
+void Publishers::Stereo_pub_thread()
+{
+
+}
+
+void Publishers::Bfs_pub_thread()
+{
+
+}
+
+
+
+
+void Publishers::ResetProcessStamp(int position)
+{
+  if(position > 0 && position < 10000){
+    processed_stamp_ = static_cast<int64_t>(static_cast<float>(last_data_stamp_ - initial_data_stamp_)*static_cast<float>(position)/static_cast<float>(10000));
+    reset_process_stamp_flag_ = true;
+  }
+
+}
+
+
+
+
